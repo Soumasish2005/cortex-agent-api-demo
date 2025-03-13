@@ -13,11 +13,16 @@ PASSWORD = st.secrets["snowflake"]["password"]
 ROLE = st.secrets["snowflake"]["role"]
 WAREHOUSE= "SALES_INTELLIGENCE_WH"
 
+print("Snowflake Host:", HOST)  # Debugging
+if not HOST:
+    st.error("HOST is not set in .streamlit.toml!")
+
 # variables shared across pages
 
 AGENT_API_ENDPOINT = "/api/v2/cortex/agent:run"
 API_TIMEOUT = 50000  # in milliseconds
-
+URL = f"https://{HOST}{AGENT_API_ENDPOINT}"
+print("Requesting URL:", URL)
 CORTEX_SEARCH_SERVICES = "sales_intelligence.data.sales_conversation_search"
 SEMANTIC_MODELS = "@sales_intelligence.data.models/sales_metrics_model.yaml" 
 
@@ -32,83 +37,76 @@ def run_snowflake_query(query):
         return None, None
 
 def agent_api_call(query: str, limit: int = 10):
-
     text = ""
     sql = ""
-    citations = []
     
     payload = {
         "model": "llama3.1-70b",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": query
-                    }
-                ]
-            }
-        ],
+        "messages": [{"role": "user", "content": [{"type": "text", "text": query}]}],
         "tools": [
-            {
-                "tool_spec": {
-                    "type": "cortex_analyst_text_to_sql",
-                    "name": "analyst1"
-                }
-            },
-            {
-                "tool_spec": {
-                    "type": "cortex_search",
-                    "name": "search1"
-                }
-            }
+            {"tool_spec": {"type": "cortex_analyst_text_to_sql", "name": "analyst1"}},
+            {"tool_spec": {"type": "cortex_search", "name": "search1"}}
         ],
         "tool_resources": {
             "analyst1": {"semantic_model_file": SEMANTIC_MODELS},
-            "search1": {
-                "name": CORTEX_SEARCH_SERVICES,
-                "max_results": limit
-            }
+            "search1": {"name": CORTEX_SEARCH_SERVICES, "max_results": limit}
         }
     }
     
     resp = requests.post(
-            url=f"https://{HOST}"+AGENT_API_ENDPOINT,
-            json=payload,
-            headers={
-                "Authorization": f'Snowflake Token="{st.session_state.CONN.rest.token}"',
-                "Content-Type": "application/json",
-            }
-        )
+        url=URL,
+        json=payload,
+        headers={
+            "Authorization": f'Snowflake Token="{st.session_state.CONN.rest.token}"',
+            "Content-Type": "application/json",
+        },
+        stream=True
+    )
 
+    if resp.status_code < 400:
+        print("Response Status Code:", resp.status_code)
+        print("Response Headers:", resp.headers)
+        print("Response Content:", resp.text[:500]) 
+        if resp.status_code != 200:
+            st.error(f"Request failed: {resp.status_code} - {resp.text}")
+            st.stop()
 
-    if resp.status_code < 400: 
+        if "text/event-stream" not in resp.headers.get("Content-Type", ""):
+            st.error("Response is not an SSE stream")
+            st.write(resp.text)  # Debugging output
+            st.stop()
+       
         client = sseclient.SSEClient(resp)
 
         for event in client.events():
-            try: 
+            try:
                 parsed = json.loads(event.data)
+                print("Parsed Event:", parsed)  # Debugging step
 
-                try: 
-                    if parsed['delta']['content'][0]['type'] == 'text': 
-                        text = parsed['delta']['content'][0]['text']
-                        yield text
-     
-                    elif parsed['delta']['content'][0]['type'] == 'tool_use': 
-                        text = parsed['delta']['content'][1]['tool_results']['content'][0]['json']['text']
-                        sql = parsed['delta']['content'][1]['tool_results']['content'][0]['json']['sql']
-                        yield text
-                        yield "\n\n `" + sql + "`" 
+                if "delta" in parsed and "content" in parsed["delta"]:
+                    content = parsed["delta"]["content"]
 
-                    else: 
-                        text = parsed
-                        yield text
+                    if isinstance(content, list) and len(content) > 0:
+                        first_content = content[0]
 
+                        if "type" in first_content:
+                            if first_content["type"] == "text":
+                                text = first_content.get("text", "")
+                                yield text
 
-                except:
-                    continue
-            except:
+                            elif first_content["type"] == "tool_use" and len(content) > 1:
+                                tool_results = content[1].get("tool_results", {}).get("content", [{}])
+                                
+                                if len(tool_results) > 0 and "json" in tool_results[0]:
+                                    json_data = tool_results[0]["json"]
+                                    text = json_data.get("text", "")
+                                    sql = json_data.get("sql", "")
+                                    
+                                    yield text
+                                    yield f"\n\n`{sql}`"
+                                
+            except json.JSONDecodeError:
+                print("Error parsing JSON:", event.data)
                 continue
 
 def main():
